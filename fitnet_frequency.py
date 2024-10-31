@@ -5,6 +5,7 @@ import torchvision
 import torchvision.transforms as transforms
 import argparse
 import torch.nn.functional as F
+from ecfd.gaussian import *
 from models.resnet import *
 from models.senet import *
 from models.mobilenet import *
@@ -14,8 +15,8 @@ from models.shufflenetv2 import *
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.manual_seed(100)
-torch.cuda.manual_seed(100)
+torch.manual_seed(1027)
+torch.cuda.manual_seed(1027)
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--model', default='resnet18', type=str)
@@ -24,6 +25,7 @@ parser.add_argument('--epoch', default=160, type=int)
 parser.add_argument('--alpha', default=0, type=float)
 parser.add_argument('--beta', default=0, type=float)
 parser.add_argument('--optim', default=True, type=bool)
+parser.add_argument('--optimize_sigma', default=False, type=bool)
 
 
 args = parser.parse_args()
@@ -146,7 +148,7 @@ teacher.adaptation_layers = nn.ModuleList([
         nn.Linear(2048, 512)
     ])
 #   teacher adaptation layers are not used in training. We add them just because the teacher in .pth has them.
-teacher.load_state_dict(torch.load("resnext_teacher.pth"))
+teacher.load_state_dict(torch.load("/home/zhanglf/kd-benchmarks/resnext_teacher.pth"))
 teacher.to(device)
 
 net = model_name()
@@ -157,36 +159,36 @@ else:
     teacher.cuda()
 net.to(device)
 criterion = nn.CrossEntropyLoss()
+# optimize_sigma
+if args.optimize_sigma:
+    print('optimize sigma')
+    lg_sigmas = torch.zeros(1, 2048).cuda()
+    lg_sigmas.requires_grad = True
+    param = list(net.parameters()) + [lg_sigmas]
+else:
+    param = net.parameters()
+    lg_sigmas = [1.0]
+# define optimizer
 optimizer = optim.SGD(
     [
-        {'params': net.parameters()},
+        {'params': param},
     ], lr=LR, weight_decay=5e-4, momentum=0.9,
 )
 
 acc1 = 0
 
 
-def frequency_loss(s_feat, t_feat):
+def frequency_loss(s_feat, t_feat, lg_sigmas, optimize_sigma):
     # s_feat: batchsize x hidden state (128 x 2048)
     # t_feat: batchsize x hidden state (128 x 2048)
     # to do: define the frequency function loss here to replace the following loss
-    # 生成随机频率，大小为(4096 x 2048)
-    dim = s_feat.shape[1]
-    num_freqs = 8
-    t = torch.randn((num_freqs, dim), device=s_feat.device)
-    # 计算s_feat特征函数
-    tX = torch.matmul(t, s_feat.t())
-    s_cf_cos = (torch.cos(tX)).mean(1)
-    s_cf_sin = (torch.sin(tX)).mean(1)
-    # 计算t_feat特征函数
-    tY = torch.matmul(t, t_feat.t())
-    t_cf_cos = (torch.cos(tY)).mean(1)
-    t_cf_sin = (torch.sin(tY)).mean(1)
-    # 计算损失 -- i复数?
-    loss = torch.sqrt((s_cf_cos-t_cf_cos) ** 2 + (s_cf_sin-t_cf_sin) ** 2)
-    # loss = torch.sqrt((s_cf_cos-t_cf_cos) ** 2 - (s_cf_sin-t_cf_sin) ** 2) # i会参与运算吗
+    if optimize_sigma:
+        sigmas = torch.exp(lg_sigmas)
+    else:
+        sigmas = lg_sigmas
+    ecfd_loss = gaussian_ecfd(s_feat, t_feat, sigmas, optimize_sigma)
     # loss = torch.dist(s_feat, t_feat) * 1e-2
-    return loss.mean()
+    return ecfd_loss
 
 
 with torch.no_grad():
@@ -234,7 +236,7 @@ if __name__ == "__main__":
             else:
                 s_feat = teacher.adaptation_layer(s_feat)
             distill_loss = CrossEntropy(outputs, t_outputs)
-            distill_loss += frequency_loss(s_feat, t_feat)
+            distill_loss += frequency_loss(s_feat, t_feat, lg_sigmas, optimize_sigma=args.optimize_sigma)
 
             sum_distill_loss += float(distill_loss)
             loss += distill_loss
